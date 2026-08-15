@@ -1,0 +1,30 @@
+name: BAZI autonomous learner
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: bazi-autonomous-learner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  predict-resolve-learn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests==2.32.5
+      - name: Predict, resolve and learn
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          KALSHI_SERIES: KXBTC15M
+        run: python bazi_autonomous_worker.py
