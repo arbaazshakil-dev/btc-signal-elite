@@ -18,6 +18,7 @@ from typing import Optional
 
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 APP_VERSION = "BAZI BTC V9 Learning"
 DB_PATH = Path(__file__).with_name("bazi_learning.sqlite3")
@@ -242,6 +243,26 @@ def history_stats(con):
     return rows, manual, accuracy
 
 
+def cloud_history():
+    """Read unattended V10 results when Supabase secrets are configured."""
+    try:
+        url = st.secrets["SUPABASE_URL"].rstrip("/")
+        key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+    except Exception:
+        return None
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    result = requests.get(
+        f"{url}/rest/v1/bazi_predictions",
+        params={"select":"market_ticker,created_at,decision,predicted_side,probability,outcome_side,correct,resolution_source",
+                "order":"created_at.desc", "limit":"100"}, headers=headers, timeout=10)
+    result.raise_for_status()
+    model = requests.get(f"{url}/rest/v1/bazi_model",
+                         params={"id":"eq.1", "select":"examples,updated_at"},
+                         headers=headers, timeout=10)
+    model.raise_for_status()
+    return result.json(), (model.json()[0] if model.json() else {"examples":0})
+
+
 def main():
     st.set_page_config(page_title=APP_VERSION, page_icon="₿", layout="wide")
     st.title(APP_VERSION)
@@ -257,6 +278,12 @@ def main():
         st.caption("Required. Copy the live reference shown by the contract; do not substitute Coinbase.")
         st.metric("Auto expiry (UTC)", datetime.fromtimestamp(expiry, timezone.utc).strftime("%H:%M:%S"))
         st.metric("Time remaining", f"{left//60:02d}:{left%60:02d}")
+        auto_refresh = st.toggle("Auto-refresh market data", value=True)
+        refresh_seconds = st.select_slider(
+            "Refresh every", options=[10, 15, 30, 60], value=10,
+            format_func=lambda value: f"{value} seconds", disabled=not auto_refresh)
+        if auto_refresh:
+            st_autorefresh(interval=refresh_seconds * 1000, key="bazi_market_refresh")
         refresh = st.button("Refresh market data", use_container_width=True)
     if refresh:
         market_snapshot.clear()
@@ -269,6 +296,8 @@ def main():
     a.metric("Coinbase BTC (primary features)", f"${snap['cb']:,.2f}")
     b.metric("Kraken BTC (confirmation)", "Unavailable" if snap["kraken"] is None else f"${snap['kraken']:,.2f}")
     c.metric("Contract position NOW", "Enter reference" if not contract_now else f"${contract_now-target:+,.2f}")
+    st.caption(f"Market calculation updated {utc_now().strftime('%H:%M:%S UTC')}"
+               + (f" · automatic refresh every {refresh_seconds}s" if auto_refresh else " · automatic refresh off"))
     if contract_now <= 0:
         st.warning("WAIT — enter the contract's live NOW/reference price. BAZI will not infer contract position from Coinbase.")
     else:
@@ -289,7 +318,26 @@ def main():
             pid = save_prediction(con, fc, target, contract_now, snap, expiry)
             st.success(f"Saved prediction {pid[:8]}. Resolve it after contract settlement so BAZI can learn.")
     st.divider()
-    st.header("Learning & outcomes")
+    st.header("Autonomous learning")
+    try:
+        cloud = cloud_history()
+    except Exception as exc:
+        cloud = None
+        st.warning(f"Cloud learning database is configured but unavailable: {exc}")
+    if cloud:
+        cloud_rows, cloud_model = cloud
+        resolved = [x for x in cloud_rows if x.get("outcome_side")]
+        correct = [x for x in resolved if x.get("correct")]
+        ca, cb, cc = st.columns(3)
+        ca.metric("Automatic predictions", len(cloud_rows))
+        cb.metric("Official outcomes learned", int(cloud_model.get("examples", 0)))
+        cc.metric("Autonomous accuracy", "—" if not resolved else f"{len(correct)/len(resolved):.1%}")
+        if cloud_rows:
+            st.dataframe(cloud_rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("Autonomous cloud history will appear here after Supabase secrets and the scheduled worker are connected.")
+
+    st.subheader("Manual outcomes")
     pending = con.execute("SELECT * FROM predictions WHERE resolved_at IS NULL ORDER BY expiry_at").fetchall()
     expired = [r for r in pending if r["expiry_at"] <= int(time.time())]
     if expired:
