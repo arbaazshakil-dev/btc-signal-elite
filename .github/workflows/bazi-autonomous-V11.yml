@@ -29,4 +29,4 @@ jobs:
           KALSHI_SERIES: KXBTC15M
           BAZI_PASSES: "4"
           BAZI_PASS_INTERVAL: "45"
-        run: bazi_autonomous_worker_V11.py
+        run: python bazi_autonomous_worker_V11.py
