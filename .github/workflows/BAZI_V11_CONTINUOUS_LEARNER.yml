@@ -1,0 +1,41 @@
+name: BAZI V11 Continuous Learner
+
+on:
+  schedule:
+    # Launch twice per hour, away from the top of the hour.
+    # Concurrency below prevents duplicate workers from running at the same time.
+    - cron: "7,37 * * * *"
+
+  workflow_dispatch:
+
+concurrency:
+  group: bazi-v11-continuous-learner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  predict-resolve-learn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install requests==2.32.5
+
+      - name: Predict, resolve and learn continuously
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          KALSHI_SERIES: KXBTC15M
+          BAZI_PASSES: "70"
+          BAZI_PASS_INTERVAL: "45"
+
+        run: python bazi_autonomous_worker_V11.py
