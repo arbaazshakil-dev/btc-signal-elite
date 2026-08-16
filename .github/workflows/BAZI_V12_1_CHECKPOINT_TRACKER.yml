@@ -30,4 +30,4 @@ jobs:
           KALSHI_SERIES: KXBTC15M
           BAZI_PASSES: "90"
           BAZI_PASS_INTERVAL: "20"
-        run: python bazi_checkpoint_worker_V12_1.py
+        run: python bazi_checkpoint_worker_V12_1a.py
