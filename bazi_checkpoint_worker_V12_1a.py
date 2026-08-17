@@ -28,10 +28,13 @@ HEADERS = {"User-Agent": "BAZI-V12.1-Checkpoint/1.0", "Accept": "application/jso
 
 CHECKPOINTS = {
     # Wider, non-overlapping windows so timing jitter does not miss checkpoints.
+    "13m": (720, 840), # 12:00–14:00 remaining
     "8m": (420, 540),  # 7:00–9:00 remaining
     "6m": (300, 419),  # 5:00–6:59 remaining
     "4m": (180, 299),  # 3:00–4:59 remaining
     "2m": (60, 179),   # 1:00–2:59 remaining
+}
+
 }
 
 # Kept in sync with bazi_autonomous_worker_V12.py so a wide-spread contract
