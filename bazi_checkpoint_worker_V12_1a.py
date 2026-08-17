@@ -34,6 +34,10 @@ CHECKPOINTS = {
     "2m": (60, 179),   # 1:00–2:59 remaining
 }
 
+# Kept in sync with bazi_autonomous_worker_V12.py so a wide-spread contract
+# is scored the same way by both systems.
+MAX_TRADEABLE_SPREAD_BPS = 4.0
+
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -108,6 +112,37 @@ def market_target(market):
     return float(nums[-1].replace(",", "")) if nums else None
 
 
+def _strike_value(market, key):
+    value = market.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 1000 else None
+
+
+def classify_market(market):
+    """Same contract-direction logic as the main V12 worker: "above" for a
+    floor strike, "below" for a cap strike, "range" if both are present."""
+    floor = _strike_value(market, "floor_strike")
+    cap = _strike_value(market, "cap_strike")
+
+    if floor is not None and cap is not None:
+        return "range", (floor, cap)
+    if floor is not None:
+        return "above", floor
+    if cap is not None:
+        return "below", cap
+
+    text = " ".join(str(market.get(k, "")) for k in ("functional_strike", "subtitle", "yes_sub_title", "title"))
+    nums = re.findall(r"\$?([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)", text)
+    if nums:
+        return "unknown", float(nums[-1].replace(",", ""))
+    return "unknown", None
+
+
 def yes_probability(market):
     vals = []
     for key in ("yes_bid_dollars", "yes_ask_dollars"):
@@ -140,6 +175,15 @@ def stdev(values, default=0.0):
     return statistics.stdev(values) if len(values) >= 2 else default
 
 
+def zscore(value, values):
+    if len(values) < 3:
+        return 0.0
+    sd = stdev(values)
+    if sd <= 1e-12:
+        return 0.0
+    return (value - statistics.mean(values)) / sd
+
+
 def hret(closes, minutes):
     if len(closes) <= minutes or closes[-minutes - 1] <= 0:
         return 0.0
@@ -163,6 +207,7 @@ def market_snapshot():
     lows = [float(x[1]) for x in rows]
     highs = [float(x[2]) for x in rows]
     closes = [float(x[4]) for x in rows]
+    volumes = [float(x[5]) for x in rows]
     rets = [math.log(b / a) for a, b in zip(closes, closes[1:]) if a > 0 and b > 0]
 
     bids = book.get("bids", [])
@@ -186,6 +231,7 @@ def market_snapshot():
         "lows": lows,
         "highs": highs,
         "closes": closes,
+        "volumes": volumes,
         "rets": rets,
         "book": imbalance,
         "spread_bps": spread_bps,
@@ -202,6 +248,7 @@ def classify_checkpoint(seconds):
 def make_prediction(market, snap, seconds):
     closes = snap["closes"]
     rets = snap["rets"]
+    volumes = snap["volumes"]
     vol_short = stdev(rets[-10:], 0.0006)
     vol_long = stdev(rets[-30:], vol_short)
     vol = clamp(0.65 * vol_short + 0.35 * vol_long, 0.00015, 0.0045)
@@ -211,36 +258,76 @@ def make_prediction(market, snap, seconds):
     m5 = clamp(hret(closes, 5) / max(vol * math.sqrt(5), 1e-9), -3, 3)
     m10 = clamp(hret(closes, 10) / max(vol * math.sqrt(10), 1e-9), -3, 3)
 
+    accel = clamp(m3 - m10, -3, 3)
+    vol_ratio = clamp(vol_short / max(vol_long, 1e-9) - 1.0, -1.5, 2.0)
+    volume_z = clamp(zscore(volumes[-1], volumes[-21:-1]), -3, 3) if len(volumes) >= 21 else 0.0
+
     ema_gap = clamp((ema(closes[-20:], 5) - ema(closes[-40:], 15)) / max(snap["cb"] * vol, 1e-9), -3, 3)
     lo15 = min(snap["lows"][-15:])
     hi15 = max(snap["highs"][-15:])
     range_pos = clamp(2.0 * ((snap["cb"] - lo15) / max(hi15 - lo15, 1e-9)) - 1.0, -1, 1)
 
-    target = market_target(market)
+    kind, strike_info = classify_market(market)
     kp = yes_probability(market)
     sigma = max(snap["cb"] * vol * math.sqrt(max(seconds, 1) / 60.0), snap["cb"] * 0.00008)
-    gap_vol = 0.0 if target is None else clamp((snap["cb"] - target) / sigma, -5, 5)
 
-    kraken_basis = 0.0 if snap["kraken"] is None else clamp((snap["kraken"] - snap["cb"]) / max(snap["cb"] * vol, 1e-9), -3, 3)
-    drift_z = clamp(0.28*m3 + 0.12*m5 + 0.10*m10 + 0.12*ema_gap + 0.10*snap["book"] + 0.06*kraken_basis, -0.9, 0.9)
-    p_target = normal_cdf(gap_vol + drift_z) if target is not None else 0.5
+    # target/gap_vol always expressed in "favors YES" terms, matching V12.
+    if kind == "above":
+        target = strike_info
+        gap_vol = clamp((snap["cb"] - target) / sigma, -5, 5)
+    elif kind == "below":
+        target = strike_info
+        gap_vol = clamp((target - snap["cb"]) / sigma, -5, 5)
+    elif kind == "range":
+        floor, cap_strike = strike_info
+        target = (floor + cap_strike) / 2.0
+        gap_vol = clamp(min((cap_strike - snap["cb"]) / sigma, (snap["cb"] - floor) / sigma), -5, 5)
+    else:
+        target = strike_info
+        gap_vol = 0.0
+
+    if snap["kraken"] is None:
+        kraken_basis = 0.0
+        kraken_agree = 0.0
+    else:
+        kraken_basis = clamp((snap["kraken"] - snap["cb"]) / max(snap["cb"] * vol, 1e-9), -3, 3)
+        trend_sign = m3 if abs(m3) > 1e-12 else m1
+        kraken_agree = 1.0 if trend_sign * (snap["kraken"] - snap["cb"]) >= 0 else -1.0
+
+    if kind in ("above", "below", "range"):
+        drift_sign = -1.0 if kind == "below" else 1.0
+        drift_z = drift_sign * clamp(0.28*m3 + 0.12*m5 + 0.10*m10 + 0.12*ema_gap + 0.10*snap["book"] + 0.06*kraken_basis, -0.9, 0.9)
+        if kind == "range":
+            floor, cap_strike = strike_info
+            z_hi = clamp((cap_strike - snap["cb"]) / sigma - drift_z, -5, 5)
+            z_lo = clamp((floor - snap["cb"]) / sigma - drift_z, -5, 5)
+            p_target = clamp(normal_cdf(z_hi) - normal_cdf(z_lo), 0.0, 1.0)
+        else:
+            p_target = normal_cdf(gap_vol + drift_z)
+    else:
+        p_target = 0.5
+
     p_trend = sigmoid(0.30*m3 + 0.18*m5 + 0.11*m10 + 0.15*ema_gap + 0.10*snap["book"] + 0.05*kraken_basis + 0.05*range_pos)
-    p_up = 0.74*p_target + 0.26*p_trend if target is not None else p_trend
+    p_up = 0.74*p_target + 0.26*p_trend if kind != "unknown" else p_trend
     if kp is not None:
         p_up = 0.92*p_up + 0.08*kp
 
-    cap = 0.94
-    if target is None:
-        cap = min(cap, 0.80)
+    cap_prob = 0.94
+    if kind == "unknown":
+        cap_prob = min(cap_prob, 0.80)
     if snap["kraken"] is None:
-        cap = min(cap, 0.86)
-    if snap["spread_bps"] > 5:
-        cap = min(cap, 0.83)
+        cap_prob = min(cap_prob, 0.86)
+    if snap["spread_bps"] > MAX_TRADEABLE_SPREAD_BPS:
+        cap_prob = min(cap_prob, 0.83)
 
-    p_up = clamp(p_up, 1.0-cap, cap)
+    p_up = clamp(p_up, 1.0 - cap_prob, cap_prob)
     side = "UP" if p_up >= 0.5 else "DOWN"
-    confidence = p_up if side == "UP" else 1.0-p_up
-    decision = "CONFIDENT" if confidence >= 0.80 and target is not None and snap["spread_bps"] <= 5 else ("LEAN" if confidence >= 0.64 else "WAIT")
+    confidence = p_up if side == "UP" else 1.0 - p_up
+    decision = (
+        "CONFIDENT"
+        if confidence >= 0.80 and kind != "unknown" and snap["spread_bps"] <= MAX_TRADEABLE_SPREAD_BPS
+        else ("LEAN" if confidence >= 0.64 else "WAIT")
+    )
 
     features = {
         "gap_vol": round(gap_vol, 6),
@@ -248,11 +335,18 @@ def make_prediction(market, snap, seconds):
         "mom_3": round(m3, 6),
         "mom_5": round(m5, 6),
         "mom_10": round(m10, 6),
+        "accel": round(accel, 6),
+        "vol_ratio": round(vol_ratio, 6),
+        "volume_z": round(volume_z, 6),
         "ema_gap": round(ema_gap, 6),
         "range_pos": round(range_pos, 6),
         "book": round(snap["book"], 6),
         "spread_bps": round(snap["spread_bps"], 6),
+        "kraken_agree": round(kraken_agree, 6),
         "kraken_basis": round(kraken_basis, 6),
+        "kalshi_market": 0.0 if kp is None else round(2.0 * kp - 1.0, 6),
+        "time_frac": round(clamp(seconds / 900.0, 0, 1), 6),
+        "contract_kind": kind,
     }
     return side, confidence, decision, features, target, kp
 
