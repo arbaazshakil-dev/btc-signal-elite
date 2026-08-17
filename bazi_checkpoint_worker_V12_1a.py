@@ -35,7 +35,7 @@ CHECKPOINTS = {
     "2m": (60, 179),   # 1:00–2:59 remaining
 }
 
-}
+
 
 # Kept in sync with bazi_autonomous_worker_V12.py so a wide-spread contract
 # is scored the same way by both systems.
