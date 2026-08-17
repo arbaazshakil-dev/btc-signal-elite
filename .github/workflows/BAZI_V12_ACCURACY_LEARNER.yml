@@ -2,10 +2,11 @@ name: BAZI V12 Accuracy Learner
 
 on:
   schedule:
-    # Two launches per hour; each worker stays alive for ~52 minutes.
-    - cron: "7,37 * * * *"
+    # One launch per hour; worker runs up to ~70 min (timeout-minutes: 70)
+    - cron: "7 * * * *"
 
   workflow_dispatch:
+
 
 concurrency:
   group: bazi-v12-accuracy-learner
