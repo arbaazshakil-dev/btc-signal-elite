@@ -38,6 +38,17 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 HEADERS = {"User-Agent": "BAZI-V12-Research/1.0", "Accept": "application/json"}
 
+# Single threshold used both to penalize confidence on a wide spread and to
+# gate the CONFIDENT decision, so the two checks can't disagree with each other.
+MAX_TRADEABLE_SPREAD_BPS = 4.0
+
+# Preferred prediction anchor: 8-12 minutes remaining. Predicting at a
+# consistent point in the contract's life gives cleaner training examples
+# than predicting whenever a poll happens to first see the contract.
+PRIMARY_WINDOW = (480, 720)
+FALLBACK_MIN_SECONDS = 60
+FALLBACK_MAX_SECONDS = 900
+
 FEATURES = (
     "gap_vol",
     "mom_1", "mom_3", "mom_5", "mom_10", "mom_15",
@@ -157,6 +168,51 @@ def market_target(market):
     )
     nums = re.findall(r"\$?([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)", text)
     return float(nums[-1].replace(",", "")) if nums else None
+
+
+def _strike_value(market, key):
+    value = market.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 1000 else None
+
+
+def classify_market(market):
+    """Determine the contract's settlement condition and threshold price(s).
+
+    Treating every market as a floor/"above" contract (the old behavior)
+    silently mis-scores any market where YES actually means "below" or
+    "within a range" -- this makes that distinction explicit instead of
+    guessing.
+
+    Returns (kind, info):
+      "above"   info = floor price;  YES resolves if price >= floor
+      "below"   info = cap price;    YES resolves if price <= cap
+      "range"   info = (floor, cap); YES resolves if floor <= price <= cap
+      "unknown" info = text-parsed price with unclear direction (rare)
+    """
+    floor = _strike_value(market, "floor_strike")
+    cap = _strike_value(market, "cap_strike")
+
+    if floor is not None and cap is not None:
+        return "range", (floor, cap)
+    if floor is not None:
+        return "above", floor
+    if cap is not None:
+        return "below", cap
+
+    text = " ".join(
+        str(market.get(k, ""))
+        for k in ("functional_strike", "subtitle", "yes_sub_title", "title")
+    )
+    nums = re.findall(r"\$?([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)", text)
+    if nums:
+        return "unknown", float(nums[-1].replace(",", ""))
+    return "unknown", None
 
 
 def yes_probability(market):
@@ -355,7 +411,7 @@ def make_prediction(market, snap, seconds):
 
     volume_z = clamp(zscore(volumes[-1], volumes[-21:-1]), -3, 3)
 
-    target = market_target(market)
+    kind, strike_info = classify_market(market)
     kp = yes_probability(market)
 
     # Expected remaining 1-sigma move, scaled from one-minute realized volatility.
@@ -364,9 +420,24 @@ def make_prediction(market, snap, seconds):
         snap["cb"] * 0.00008,
     )
 
-    if target is not None:
+    # target/gap_vol are always expressed in "favors YES" terms so the
+    # ensemble and learned model don't need to know the contract kind.
+    if kind == "above":
+        target = strike_info
         gap_vol = clamp((snap["cb"] - target) / sigma, -5, 5)
+    elif kind == "below":
+        target = strike_info
+        gap_vol = clamp((target - snap["cb"]) / sigma, -5, 5)
+    elif kind == "range":
+        floor, cap_strike = strike_info
+        target = (floor + cap_strike) / 2.0
+        gap_vol = clamp(
+            min((cap_strike - snap["cb"]) / sigma, (snap["cb"] - floor) / sigma),
+            -5,
+            5,
+        )
     else:
+        target = strike_info  # text-parsed price, direction unclear
         gap_vol = 0.0
 
     if snap["kraken"] is None:
@@ -400,18 +471,28 @@ def make_prediction(market, snap, seconds):
         "kraken_basis": kraken_basis,
         "kalshi_market": 0.0 if kp is None else 2.0 * kp - 1.0,
         "time_frac": clamp(seconds / 900.0, 0, 1),
+        "contract_kind": kind,
     }
 
-    # Component 1: contract geometry. This dominates when an exact target exists.
-    if target is not None:
+    # Component 1: contract geometry. This dominates when the strike direction is known.
+    if kind in ("above", "below", "range"):
         # Small drift adjustment; deliberately capped to avoid chasing noise.
-        drift_z = clamp(
+        # Sign flips for "below" contracts: upward momentum works against YES.
+        drift_sign = -1.0 if kind == "below" else 1.0
+        drift_z = drift_sign * clamp(
             0.25 * mom3 + 0.12 * mom10 + 0.10 * ema_gap + 0.08 * snap["book"],
             -0.8,
             0.8,
         )
-        p_target = normal_cdf(gap_vol + drift_z)
+        if kind == "range":
+            floor, cap_strike = strike_info
+            z_hi = clamp((cap_strike - snap["cb"]) / sigma - drift_z, -5, 5)
+            z_lo = clamp((floor - snap["cb"]) / sigma - drift_z, -5, 5)
+            p_target = clamp(normal_cdf(z_hi) - normal_cdf(z_lo), 0.0, 1.0)
+        else:
+            p_target = normal_cdf(gap_vol + drift_z)
     else:
+        # Unknown strike direction: stay neutral rather than guess a side.
         p_target = 0.5
 
     # Component 2: continuation/trend.
@@ -474,7 +555,7 @@ def make_prediction(market, snap, seconds):
         cap = min(cap, 0.80)
     if snap["kraken"] is None:
         cap = min(cap, 0.86)
-    if snap["spread_bps"] > 4:
+    if snap["spread_bps"] > MAX_TRADEABLE_SPREAD_BPS:
         cap = min(cap, 0.84)
 
     # If realized accuracy is poor, shrink probability toward 50%.
@@ -490,9 +571,9 @@ def make_prediction(market, snap, seconds):
     # Require stronger proof for an actionable pick.
     if (
         confidence >= 0.80
-        and target is not None
+        and kind != "unknown"
         and snap["kraken"] is not None
-        and snap["spread_bps"] <= 5
+        and snap["spread_bps"] <= MAX_TRADEABLE_SPREAD_BPS
     ):
         decision = "CONFIDENT"
     elif confidence >= 0.64:
@@ -515,8 +596,23 @@ def already_logged(ticker):
     return bool(rows)
 
 
+def _eligible(seconds):
+    lo, hi = PRIMARY_WINDOW
+    if lo <= seconds <= hi:
+        return True
+    # Fallback net: only log outside the primary window if the contract has
+    # already passed it (a poll gap caused a miss), never jump the gun on a
+    # contract that hasn't reached the window yet.
+    if FALLBACK_MIN_SECONDS <= seconds < lo:
+        return True
+    return False
+
+
 def discover_and_predict():
-    """Capture each open KXBTC15M contract once while 1–15 minutes remain."""
+    """Capture each open KXBTC15M contract once, anchored to 8-12 minutes
+    remaining when possible so predictions land at a consistent point in the
+    contract's life. Falls back to logging immediately if that window was
+    missed due to a poll gap, so no contract goes unpredicted."""
     data = get(
         f"{KALSHI}/markets",
         {"series_ticker": SERIES, "status": "open", "limit": 100},
@@ -529,7 +625,9 @@ def discover_and_predict():
         if not expiry:
             continue
         seconds = int((expiry - now).total_seconds())
-        if 60 <= seconds <= 900:
+        if seconds > FALLBACK_MAX_SECONDS:
+            continue
+        if _eligible(seconds):
             candidates.append((seconds, market, expiry))
 
     candidates.sort(key=lambda item: item[0])
