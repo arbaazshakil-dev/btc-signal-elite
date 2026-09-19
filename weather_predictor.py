@@ -57,6 +57,12 @@ def get_kalshi_markets(series_ticker):
     r.raise_for_status()
     return r.json().get("markets", [])
 
+def get_todays_event_ticker(series_ticker):
+    """Build today's event_ticker, e.g. KXHIGHNY-26SEP19, to filter markets to today only."""
+    today = datetime.now(timezone.utc)
+    date_part = today.strftime("%y%b%d").upper()  # e.g. 26SEP19
+    return f"{series_ticker}-{date_part}"
+
 def run():
     results = []
     for city, cfg in CITIES.items():
@@ -65,15 +71,23 @@ def run():
             corrected_mean = raw_forecast + cfg["bias"]
             std = cfg["std"]
 
-            markets = get_kalshi_markets(cfg["kalshi_series"])
+            all_markets = get_kalshi_markets(cfg["kalshi_series"])
+
+            # Only keep today's event for this city (skip tomorrow/other days mixed into the same series)
+            todays_event = get_todays_event_ticker(cfg["kalshi_series"])
+            markets = [m for m in all_markets if m.get("event_ticker") == todays_event]
+
+            if not markets:
+                print(f"No markets found for {city} matching event {todays_event} (found {len(all_markets)} total in series)")
+                continue
 
             for m in markets:
                 floor_strike = m.get("floor_strike")
                 cap_strike = m.get("cap_strike")
                 our_prob = bracket_probability(corrected_mean, std, floor_strike, cap_strike)
 
-                yes_ask = m.get("yes_ask", 0) / 100  # cents to probability
-                yes_bid = m.get("yes_bid", 0) / 100
+                yes_ask = float(m.get("yes_ask_dollars", 0) or 0)
+                yes_bid = float(m.get("yes_bid_dollars", 0) or 0)
                 market_prob = (yes_ask + yes_bid) / 2 if (yes_ask and yes_bid) else yes_ask
 
                 edge = our_prob - market_prob
@@ -97,6 +111,8 @@ def run():
     if results:
         supabase.table("weather_predictions").insert(results).execute()
         print(f"Inserted {len(results)} rows")
+    else:
+        print("No results to insert")
 
 if __name__ == "__main__":
     run()
