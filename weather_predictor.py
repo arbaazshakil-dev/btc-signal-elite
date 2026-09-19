@@ -93,7 +93,7 @@ def record_yesterdays_outcome(city, series_ticker):
     yesterday = datetime.now(timezone.utc) - timedelta(days=1)
     event_ticker = get_event_ticker_for_date(series_ticker, yesterday)
 
-    finalized = get_kalshi_markets(series_ticker, status="finalized")
+    finalized = get_kalshi_markets(series_ticker, status="settled")
     todays_finalized = [m for m in finalized if m.get("event_ticker") == event_ticker]
 
     if not todays_finalized:
